@@ -1,4 +1,3 @@
-## Script for collecting ALL logs from a specific timeframe. It outputs in a searchable gridview. ##
 $OutDir = 'C:\MrLog'
 if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir | Out-Null
@@ -6,11 +5,21 @@ if (-not (Test-Path $OutDir)) {
 
 # ---------- Discover all enabled, non-empty logs ----------
 Write-Host "Enumerating event logs..." -ForegroundColor Cyan
+
+# Logs to skip — these generate noise from the script's own activity
+# (PowerShell logs every Get-WinEvent "no events found" as 4100, which
+# would feed back into our realtime stream forever).
+$ExcludedLogs = @(
+    'Microsoft-Windows-PowerShell/Operational',
+    'PowerShellCore/Operational',
+    'Windows PowerShell'
+)
+
 $AllLogs = Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
-    Where-Object { $_.IsEnabled -and $_.RecordCount -gt 0 } |
+    Where-Object { $_.IsEnabled -and $_.RecordCount -gt 0 -and $ExcludedLogs -notcontains $_.LogName } |
     Select-Object -ExpandProperty LogName
 
-Write-Host "Found $($AllLogs.Count) enabled logs with records." -ForegroundColor Green
+Write-Host "Found $($AllLogs.Count) enabled logs with records (excluding $($ExcludedLogs.Count) PowerShell self-noise logs)." -ForegroundColor Green
 
 # ---------- Prompt 1: Time range ----------
 Write-Host ""
@@ -94,12 +103,8 @@ if ($Realtime) {
     # Track most recent RecordId per log so we don't repeat
     $LastSeen = @{}
     foreach ($l in $AllLogs) {
-        try {
-            $latest = Get-WinEvent -LogName $l -MaxEvents 1 -ErrorAction Stop
-            $LastSeen[$l] = $latest.RecordId
-        } catch {
-            $LastSeen[$l] = 0
-        }
+        $latest = Get-WinEvent -LogName $l -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($latest) { $LastSeen[$l] = $latest.RecordId } else { $LastSeen[$l] = 0 }
     }
 
     $allEvents = New-Object System.Collections.Generic.List[object]
@@ -107,15 +112,18 @@ if ($Realtime) {
     try {
         while ($true) {
             foreach ($l in $AllLogs) {
-                try {
-                    $batch = Get-WinEvent -FilterHashtable @{
-                        LogName   = $l
-                        Level     = $Levels
-                        StartTime = (Get-Date).AddMinutes(-2)
-                    } -ErrorAction Stop |
-                        Where-Object { $_.RecordId -gt $LastSeen[$l] } |
-                        Sort-Object RecordId
+                $batch = Get-WinEvent -FilterHashtable @{
+                    LogName   = $l
+                    Level     = $Levels
+                    StartTime = (Get-Date).AddMinutes(-2)
+                } -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.RecordId -gt $LastSeen[$l] -and
+                        -not ($_.Id -eq 4100 -and $_.ProviderName -like '*PowerShell*')
+                    } |
+                    Sort-Object RecordId
 
+                if ($batch) {
                     foreach ($evt in $batch) {
                         $LastSeen[$l] = [Math]::Max($LastSeen[$l], $evt.RecordId)
                         $allEvents.Add($evt)
@@ -138,8 +146,6 @@ if ($Realtime) {
                             Add-Content -Path $TextPath -Value ('-' * 80)
                         }
                     }
-                } catch {
-                    # No matching events / log temporarily unreadable — keep polling
                 }
             }
             Start-Sleep -Seconds 3
@@ -174,17 +180,14 @@ foreach ($l in $AllLogs) {
     $i++
     Write-Progress -Activity "Querying event logs" -Status $l `
         -PercentComplete ([int](($i / $AllLogs.Count) * 100))
-    try {
-        $found = Get-WinEvent -FilterHashtable @{
-            LogName   = $l
-            Level     = $Levels
-            StartTime = $Start
-            EndTime   = $End
-        } -ErrorAction Stop
-        foreach ($e in $found) { $Events.Add($e) }
-    } catch {
-        # "No events were found" is the normal case for most logs — ignore
-    }
+    $found = Get-WinEvent -FilterHashtable @{
+        LogName   = $l
+        Level     = $Levels
+        StartTime = $Start
+        EndTime   = $End
+    } -ErrorAction SilentlyContinue |
+        Where-Object { -not ($_.Id -eq 4100 -and $_.ProviderName -like '*PowerShell*') }
+    if ($found) { foreach ($e in $found) { $Events.Add($e) } }
 }
 Write-Progress -Activity "Querying event logs" -Completed
 
